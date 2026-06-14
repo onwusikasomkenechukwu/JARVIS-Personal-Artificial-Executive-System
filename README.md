@@ -56,7 +56,7 @@ and can never exceed Level 2 automatically, no matter what the content claims.
 
 Capability does not ship ahead of its controls.
 
-- **Phase 1 — Personal AI Assistant:** conversation, memory, tool calling, browser control. *(instruction/data separation, credential non-exposure, tool allowlist, memory provenance, fact lifecycle)*
+- **Phase 1 — Personal AI Assistant** ✅ **complete & validated:** browser control, typed requests, memory, tool calling. *(instruction/data separation, credential non-exposure, tool allowlist, memory provenance, fact lifecycle)*
 - **Phase 2 — Executive Agent:** planning, project management, scheduling, research. *(trust-boundary isolation, decorrelated auditor, provenance pre-filter, Runtime Governor, Skill Registry)*
 - **Phase 3 — Personal OS:** device control, smart home, world model. *(Level 4 hard ceilings, autonomy budget governors)*
 - **Phase 4 — Embodied Intelligence:** vision, gesture, robotics. *(hardware kill path, force/rate ceilings)*
@@ -64,26 +64,50 @@ Capability does not ship ahead of its controls.
 
 ## Status
 
-🚧 **Phase 1 in progress.** Phase 1 is deliberately small: a single async Python process.
-The single most important deliverable is **milestone 0 — the browser reliability gate**: if
-real-world browser control isn't reliable enough, the rest of the architecture doesn't matter.
+✅ **Phase 1 complete and validated.** A single async Python process. The defining
+deliverable — **milestone 0, the browser reliability gate** — passed, so the rest of the
+architecture earns the right to be built. Phase 2 has not started (it is gated on an
+explicit decision that the reliability result justifies it).
 
-### Phase 1 scope (single process)
+**The gate result (`--target wikipedia --n 100`):**
 
-1. Drive a browser to navigate / read / fill / click (Playwright, async).
-2. **Measure its own reliability** over 100 repeated runs of a task.
-3. Carry every action as a **typed request with a provenance label** (`jarvis/requests.py`).
-4. Route requests through a **default-deny tool allowlist parameterized by provenance** (`jarvis/router.py`).
-5. Store memory in Postgres with **provenance tags + fact expiration** (`jarvis/memory/`).
-6. Gate higher-risk actions through an **out-of-band confirmation** step (`jarvis/confirm.py`).
+```
+runs:                  100
+first-attempt success: 100  (100.0%)   <- no retry needed
+total retry events:      0
+browser-class:           0  (0.0%)     <- the gating signal
+harness-class:           0  (0.0%)     <- ~0, so the number is trustworthy
+```
 
-| Milestone | Module | Acceptance test |
-|-----------|--------|-----------------|
-| 0 — Browser + reliability harness (**the gate**) | `tools/browser.py`, `harness/reliability.py` | `tests/test_reliability_harness.py` |
-| 1 — Typed request + provenance escalation | `requests.py`, `provenance.py` | `tests/test_provenance.py` |
-| 2 — Default-deny tool router | `router.py` | `tests/test_router.py` |
-| 3 — Memory with provenance + expiration | `memory/` | `tests/test_memory_expiration.py` |
-| 4 — Out-of-band confirmation gate | `confirm.py` | `tests/test_confirm.py` |
+100/100 on the first attempt with zero retries. *Caveat:* Wikipedia is cooperative, so
+this is a **floor on difficulty, not a representative number** — it proves the executor
+works when a site behaves, not that browsing is reliable against hostile sites.
+
+### Milestones (all built, tested — 31 passing tests)
+
+| Milestone | Module | Status | Tests |
+|-----------|--------|--------|-------|
+| 0 — Browser + reliability harness (**the gate**) | `tools/browser.py`, `harness/reliability.py` | ✅ passed gate | `tests/test_reliability_harness.py` |
+| 1 — Typed request + provenance escalation | `requests.py`, `provenance.py` | ✅ | `tests/test_provenance.py` |
+| 2 — Default-deny tool router | `router.py` | ✅ | `tests/test_router.py` |
+| 3 — Memory with provenance + expiration | `memory/` | ✅ validated on real Postgres | `tests/test_memory_expiration.py` |
+| 4 — Out-of-band confirmation gate | `confirm.py` | ✅ | `tests/test_confirm.py` |
+
+The reliability harness reports **first-attempt** success separately from post-retry
+success, so retries can never silently inflate the gate number (`browser_retries` default
+is 3).
+
+### Decorrelated-verification spike
+
+A time-boxed experiment (not a shipped feature) testing whether an auditor can confirm a
+side-effecting action through a channel that did **not** consume the untrusted input that
+drove it. An untrusted-derived memory write (live Wikipedia read → `facts` store) is
+verified by querying Postgres only — never re-reading the page. Measured: **executor
+untrusted reads = 1, verifier = 0, VERIFIED = True**, confirmed durable on PostgreSQL 18.
+
+Full honest findings — including why the green result came cheap and where the principle
+is still unproven — in [`docs/verification-spike-findings.md`](docs/verification-spike-findings.md).
+Code: `jarvis/spikes/decorrelated_verification.py`.
 
 ### Setup
 
@@ -91,20 +115,28 @@ real-world browser control isn't reliable enough, the rest of the architecture d
 python -m venv .venv
 # Windows:  .venv\Scripts\activate     |  macOS/Linux:  source .venv/bin/activate
 pip install -e ".[dev]"
-playwright install chromium          # browser binary for milestone 0
-cp .env.example .env                 # then edit (Postgres URL etc.)
+playwright install chromium          # browser binary for milestone 0 / the spike
+cp .env.example .env                 # then edit (Postgres DSN etc.)
 ```
 
-### Run the tests (logic milestones 1–4 + harness mechanics)
+**Postgres** (needed only for the durable memory store / the spike's `--postgres` run).
+Create the role + database the default DSN expects:
+
+```sql
+CREATE ROLE jarvis LOGIN PASSWORD 'jarvis';
+CREATE DATABASE jarvis OWNER jarvis;
+```
+
+### Run the tests (31 — logic, harness mechanics, spike)
 
 ```bash
 pytest
 ```
 
-These run without a browser or database (the harness test uses a stub browser; the
-memory tests cover the pure expiration/policy logic).
+These run without a browser or database (stub browser; in-memory fact fixture; pure
+expiration/policy logic).
 
-### Run the reliability gate (milestone 0 — manual)
+### Run the reliability gate (milestone 0)
 
 ```bash
 # Stage A — validate the harness against a scrape-friendly site (expect ~99%+):
@@ -114,11 +146,16 @@ python -m jarvis.harness.reliability --target books --n 100
 python -m jarvis.harness.reliability --target wikipedia --n 100
 ```
 
-**Interpretation.** Stage A proves the harness's own `harness`-class error rate is ~0.
-Stage B is the number that gates the project — but Wikipedia is cooperative, so treat it
-as a *floor* on difficulty, not a representative one. If the Stage B `browser`-class
-failure rate is unacceptable (discuss the line, e.g. >5%), **stop and reconsider** before
-building further. Capability does not ship ahead of reliability.
+Stage A proves the harness's own `harness`-class error rate is ~0; Stage B is the number
+that gates the project. If the Stage B `browser`-class rate is unacceptable (discuss the
+line, e.g. >5%), **stop and reconsider** before building further.
+
+### Run the decorrelated-verification spike
+
+```bash
+python -m jarvis.spikes.decorrelated_verification              # in-memory fact store
+python -m jarvis.spikes.decorrelated_verification --postgres   # durable, real Postgres
+```
 
 ### Out-of-band confirmation (milestone 4)
 
