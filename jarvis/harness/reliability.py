@@ -51,10 +51,19 @@ class ReliabilityReport:
     failure: int
     error_class_histogram: dict[str, int]
     failures: list[FailureDetail] = field(default_factory=list)
+    # First-attempt visibility: the existing `success` is a post-retry, final-outcome
+    # number. These expose how much retrying was hiding underneath it.
+    first_attempt_success: int = 0      # iterations where every primitive succeeded on attempt 1
+    iterations_with_retry: int = 0      # iterations that succeeded but needed >=1 retry
+    total_retries: int = 0              # all retry events across the whole run
 
     @property
     def failure_rate(self) -> float:
         return self.failure / self.total if self.total else 0.0
+
+    @property
+    def first_attempt_success_rate(self) -> float:
+        return self.first_attempt_success / self.total if self.total else 0.0
 
     @property
     def harness_error_count(self) -> int:
@@ -75,11 +84,14 @@ class ReliabilityReport:
     def render(self) -> str:
         lines = [
             f"Reliability report — task '{self.task_name}'",
-            f"  runs:              {self.total}",
-            f"  success:           {self.success}",
-            f"  failure:           {self.failure}  ({self.failure_rate:.1%})",
-            f"  browser-class:     {self.browser_failure_count}  ({self.browser_failure_rate:.1%})  <- the gating signal",
-            f"  harness-class:     {self.harness_error_count}  ({self.harness_error_rate:.1%})  <- must be ~0 to trust the above",
+            f"  runs:                  {self.total}",
+            f"  success (final):       {self.success}",
+            f"  first-attempt success: {self.first_attempt_success}  ({self.first_attempt_success_rate:.1%})  <- no retry needed",
+            f"  succeeded w/ retry:    {self.iterations_with_retry}  (ok only after >=1 retry)",
+            f"  total retry events:    {self.total_retries}",
+            f"  failure:               {self.failure}  ({self.failure_rate:.1%})",
+            f"  browser-class:         {self.browser_failure_count}  ({self.browser_failure_rate:.1%})  <- the gating signal",
+            f"  harness-class:         {self.harness_error_count}  ({self.harness_error_rate:.1%})  <- must be ~0 to trust the above",
         ]
         if self.harness_error_rate > 0.01:
             lines.append("  !! harness-class rate > 1% — the harness is buggy; browser numbers are NOT trustworthy yet.")
@@ -107,6 +119,9 @@ async def run_reliability(
     hist: Counter[str] = Counter()
     failures: list[FailureDetail] = []
     success = 0
+    first_attempt_success = 0
+    iterations_with_retry = 0
+    total_retries = 0
     try:
         for i in range(1, n + 1):
             if reset_between and hasattr(browser, "reset"):
@@ -125,8 +140,17 @@ async def run_reliability(
                 failures.append(FailureDetail(i, "harness", f"{type(e).__name__}: {e}"))
                 continue
 
+            # Retries accumulated by the browser during this iteration. Guarded so a
+            # stub browser without the counter still works.
+            retries = getattr(browser, "_iteration_retries", 0)
+            total_retries += retries
+
             if result.ok:
                 success += 1
+                if retries == 0:
+                    first_attempt_success += 1
+                else:
+                    iterations_with_retry += 1
             else:
                 ec = result.error_class or "browser"
                 hist[ec] += 1
@@ -135,7 +159,17 @@ async def run_reliability(
         if owns_browser:
             await browser.close()
 
-    return ReliabilityReport(task_name, n, success, n - success, dict(hist), failures)
+    return ReliabilityReport(
+        task_name,
+        n,
+        success,
+        n - success,
+        dict(hist),
+        failures,
+        first_attempt_success=first_attempt_success,
+        iterations_with_retry=iterations_with_retry,
+        total_retries=total_retries,
+    )
 
 
 # --- Task definitions -------------------------------------------------------

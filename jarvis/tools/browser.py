@@ -53,6 +53,9 @@ class BrowserTool:
         self._browser = None
         self._context = None
         self._page = None
+        # Retry events accumulated within the current iteration (extra attempts
+        # beyond the first, summed across every primitive). Zeroed by reset().
+        self._iteration_retries = 0
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
@@ -68,6 +71,7 @@ class BrowserTool:
 
     async def reset(self) -> None:
         """Drop the current context and open a clean one (fresh state per run)."""
+        self._iteration_retries = 0
         if self._context is not None:
             await self._context.close()
         await self._new_context()
@@ -86,6 +90,9 @@ class BrowserTool:
 
         last_err: Optional[str] = None
         for attempt in range(1, self.retries + 1):
+            if attempt > 1:
+                # An attempt beyond the first is a retry event for this iteration.
+                self._iteration_retries += 1
             try:
                 value = await fn()
                 return ToolResult(ok=True, value=value, attempts=attempt)

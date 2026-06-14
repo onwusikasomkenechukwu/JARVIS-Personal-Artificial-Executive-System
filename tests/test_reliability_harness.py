@@ -48,3 +48,38 @@ async def test_task_exception_is_harness_class_not_browser():
     assert rep.harness_error_count == 5
     assert rep.error_class_histogram.get("browser", 0) == 0
     assert rep.harness_error_rate == 1.0
+
+
+# --- First-attempt visibility (Task A) -------------------------------------
+
+class RetryScriptedBrowser:
+    """A stub whose per-iteration retry count is scripted. reset() advances to the
+    next iteration's value, mimicking BrowserTool zeroing-then-accumulating."""
+
+    def __init__(self, retry_sequence: list[int]) -> None:
+        self._seq = retry_sequence
+        self._i = -1
+        self._iteration_retries = 0
+
+    async def reset(self) -> None:
+        self._i += 1
+        self._iteration_retries = self._seq[self._i]
+
+
+async def test_first_attempt_counters_split_retried_from_clean():
+    # 5 successful iterations: two needed retries (2 and 1), three were clean.
+    seq = [0, 0, 2, 1, 0]
+    rep = await run_reliability(ok_task, "stub_retry", n=5, browser=RetryScriptedBrowser(seq))
+    assert rep.success == 5
+    assert rep.first_attempt_success == 3          # the three zero-retry iterations
+    assert rep.first_attempt_success_rate == 0.6
+    assert rep.iterations_with_retry == 2          # the 2-retry and 1-retry iterations
+    assert rep.total_retries == 3                  # 2 + 1
+
+
+async def test_stub_without_counter_treated_as_first_attempt():
+    # StubBrowser has no _iteration_retries; getattr guard -> 0 -> all first-attempt.
+    rep = await run_reliability(ok_task, "stub_no_counter", n=4, browser=StubBrowser())
+    assert rep.first_attempt_success == 4
+    assert rep.iterations_with_retry == 0
+    assert rep.total_retries == 0
