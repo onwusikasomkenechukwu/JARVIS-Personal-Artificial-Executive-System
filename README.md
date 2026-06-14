@@ -64,7 +64,72 @@ Capability does not ship ahead of its controls.
 
 ## Status
 
-🚧 Early development — scaffolding Phase 1.
+🚧 **Phase 1 in progress.** Phase 1 is deliberately small: a single async Python process.
+The single most important deliverable is **milestone 0 — the browser reliability gate**: if
+real-world browser control isn't reliable enough, the rest of the architecture doesn't matter.
+
+### Phase 1 scope (single process)
+
+1. Drive a browser to navigate / read / fill / click (Playwright, async).
+2. **Measure its own reliability** over 100 repeated runs of a task.
+3. Carry every action as a **typed request with a provenance label** (`jarvis/requests.py`).
+4. Route requests through a **default-deny tool allowlist parameterized by provenance** (`jarvis/router.py`).
+5. Store memory in Postgres with **provenance tags + fact expiration** (`jarvis/memory/`).
+6. Gate higher-risk actions through an **out-of-band confirmation** step (`jarvis/confirm.py`).
+
+| Milestone | Module | Acceptance test |
+|-----------|--------|-----------------|
+| 0 — Browser + reliability harness (**the gate**) | `tools/browser.py`, `harness/reliability.py` | `tests/test_reliability_harness.py` |
+| 1 — Typed request + provenance escalation | `requests.py`, `provenance.py` | `tests/test_provenance.py` |
+| 2 — Default-deny tool router | `router.py` | `tests/test_router.py` |
+| 3 — Memory with provenance + expiration | `memory/` | `tests/test_memory_expiration.py` |
+| 4 — Out-of-band confirmation gate | `confirm.py` | `tests/test_confirm.py` |
+
+### Setup
+
+```bash
+python -m venv .venv
+# Windows:  .venv\Scripts\activate     |  macOS/Linux:  source .venv/bin/activate
+pip install -e ".[dev]"
+playwright install chromium          # browser binary for milestone 0
+cp .env.example .env                 # then edit (Postgres URL etc.)
+```
+
+### Run the tests (logic milestones 1–4 + harness mechanics)
+
+```bash
+pytest
+```
+
+These run without a browser or database (the harness test uses a stub browser; the
+memory tests cover the pure expiration/policy logic).
+
+### Run the reliability gate (milestone 0 — manual)
+
+```bash
+# Stage A — validate the harness against a scrape-friendly site (expect ~99%+):
+python -m jarvis.harness.reliability --target books --n 100
+
+# Stage B — the gating brittleness number, against Wikipedia:
+python -m jarvis.harness.reliability --target wikipedia --n 100
+```
+
+**Interpretation.** Stage A proves the harness's own `harness`-class error rate is ~0.
+Stage B is the number that gates the project — but Wikipedia is cooperative, so treat it
+as a *floor* on difficulty, not a representative one. If the Stage B `browser`-class
+failure rate is unacceptable (discuss the line, e.g. >5%), **stop and reconsider** before
+building further. Capability does not ship ahead of reliability.
+
+### Out-of-band confirmation (milestone 4)
+
+When the app requests a Level ≥2 action it writes a pending request; you approve it from
+a **separate** terminal/process so the requesting path can't self-approve:
+
+```bash
+python -m jarvis.confirm list
+python -m jarvis.confirm approve <id>
+python -m jarvis.confirm deny <id>
+```
 
 ## License
 

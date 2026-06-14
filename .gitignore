@@ -39,6 +39,9 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Out-of-band confirmation spool
+.pending_confirmations/
+
 # Temp
 tmp/
 *.tmp
