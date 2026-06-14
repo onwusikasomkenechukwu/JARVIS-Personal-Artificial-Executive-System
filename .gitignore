@@ -1,0 +1,45 @@
+# Secrets / credentials — NEVER commit
+.env
+.env.*
+*.key
+*.pem
+secrets/
+vault/
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / TS
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.npm/
+
+# Logs & local data
+*.log
+logs/
+data/
+*.sqlite
+*.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Temp
+tmp/
+*.tmp
+_*.txt
