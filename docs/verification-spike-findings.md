@@ -38,20 +38,25 @@ Because Task A's first-attempt run showed **0 retries** on the cooperative read 
 the executor consumes the untrusted input exactly **once** per action. The retry-driven
 multiple-read path therefore did not trigger here; the harness counts it if it ever does.
 
-### What was run vs. what you must run
+### What was run
 
-- **Run here (real):** live Wikipedia read → write → verify, against the **in-memory**
-  fact repository. The read-count and decorrelation properties are identical to the
-  Postgres path — only durability is stubbed.
-- **You must run (durability):** the same flow against real Postgres:
-  ```
-  python -m jarvis.spikes.decorrelated_verification --postgres
-  ```
-  This exercises `AsyncpgFactRepository` against the actual `facts` table. It does not
-  change the finding; it confirms the row survives a real transactional store.
-- **Tests:** 6 tests run against the in-memory fixture (no Postgres needed), covering
-  clean-verify-true, missing-verify-false, duplicate-detected, untrusted-without-review
-  rejected, content-mismatch-fails, and the verifier-reads-no-page property.
+- **In-memory path (real read):** live Wikipedia read → write → verify against the
+  in-memory fact repository. Result: `executor=1, verifier=0, VERIFIED=True`.
+- **Postgres durability path (confirmed 2026-06-14):** the same flow against real
+  PostgreSQL 18 via `python -m jarvis.spikes.decorrelated_verification --postgres`,
+  exercising `AsyncpgFactRepository` against the actual `facts` table. **Identical
+  result** (`executor=1, verifier=0, VERIFIED=True`); the row survives a real
+  transactional store. Durability does not change the decorrelation finding, as
+  predicted.
+- **Milestone-3 memory store, end-to-end on Postgres (confirmed 2026-06-14):** stable
+  fact never expires; a volatile fact past its interval reads back stale *and* the
+  `stale` column is persisted (flag-not-delete); an untrusted write without review is
+  rejected; an untrusted write with review is stored tagged `UNTRUSTED_DERIVED`. This
+  was previously only covered at the pure-logic level.
+- **Tests:** 6 spike tests run against the in-memory fixture (no Postgres needed),
+  covering clean-verify-true, missing-verify-false, duplicate-detected,
+  untrusted-without-review rejected, content-mismatch-fails, and the
+  verifier-reads-no-page property.
 
 ---
 
