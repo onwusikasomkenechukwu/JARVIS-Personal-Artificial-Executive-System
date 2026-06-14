@@ -56,6 +56,10 @@ class BrowserTool:
         # Retry events accumulated within the current iteration (extra attempts
         # beyond the first, summed across every primitive). Zeroed by reset().
         self._iteration_retries = 0
+        # Count of actual content reads against the live page, incremented per
+        # attempt (so retries count). Monotonic; the verification spike snapshots
+        # deltas around it to measure untrusted_read_count.
+        self._read_attempts = 0
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
@@ -119,6 +123,9 @@ class BrowserTool:
 
     async def read(self, selector: str | None = None) -> ToolResult:
         async def op() -> str:
+            # Runs once per attempt inside _guard, so retries are counted too —
+            # this is the "untrusted input consumed" signal the spike measures.
+            self._read_attempts += 1
             target = selector if selector is not None else "body"
             return await self._page.inner_text(target)
 
