@@ -10,6 +10,15 @@ in two independent layers:
   2. TYPE. `MessageState` carries only state fields and structurally cannot hold a body,
      snippet, or payload. Belt and suspenders; the belt is Google's.
 
+A real consequence of layer 1: the `gmail.metadata` scope REJECTS the `q` search
+parameter ("Metadata scope does not support 'q' parameter") — `q` can match body text,
+so the metadata scope forbids it. We therefore resolve the RFC Message-ID the
+metadata-compatible way: list messages (most recent first) and match each candidate's
+`Message-Id` header client-side, reading only that one routing header per skipped
+message and never any content. The cost is O(position of the target in recency order),
+bounded by `max_scan`; for the verifier's case (a just-sent message) the match is near
+the front. Widening to `gmail.readonly` to get `q` back is explicitly NOT done.
+
 The metadata-scoped token lives in the credential vault (outside the repo). The agent
 code path holds a handle, never the raw token; only credential loading here resolves it.
 
@@ -46,6 +55,15 @@ STATE_HEADERS: tuple[str, ...] = ("From", "To", "Subject", "Date")
 # only labelIds and headers, and the metadata scope would reject the broader formats.
 MESSAGE_FORMAT = "metadata"
 
+# The routing header we match on during resolution (the only header read off messages
+# we then skip). Never content.
+MESSAGE_ID_HEADER = "Message-Id"
+
+# Default cap on how many messages resolution will examine before giving up. Resolution
+# is most-recent-first, so a just-sent message is found almost immediately; the cap just
+# bounds the worst case for an old or absent id.
+DEFAULT_MAX_SCAN = 250
+
 # Vault key for the stored metadata-scoped token.
 GMAIL_TOKEN_KEY = "gmail_metadata_token.json"
 
@@ -72,16 +90,19 @@ async def confirm_message_state(
     rfc_message_id: str,
     *,
     service: Any | None = None,
+    max_scan: int = DEFAULT_MAX_SCAN,
 ) -> MessageState:
     """Confirm the provider state of the message with RFC 2822 Message-ID `rfc_message_id`.
 
-    Resolves the RFC Message-ID to Gmail's internal id, then reads metadata-only state.
-    Returns `exists=False` if nothing matches. `service` is injected in tests; in
-    production it is built from the metadata-scoped vault credentials.
+    Resolves the RFC Message-ID to Gmail's internal id (by header match — see module
+    docstring; `q` is unavailable under the metadata scope), then reads metadata-only
+    state. Returns `exists=False` if nothing matches within `max_scan` messages.
+    `service` is injected in tests; in production it is built from the metadata-scoped
+    vault credentials.
     """
     svc = service if service is not None else build_gmail_service()
 
-    gmail_id = await _resolve_internal_id(svc, rfc_message_id)
+    gmail_id = await _resolve_internal_id(svc, rfc_message_id, max_scan)
     if gmail_id is None:
         return MessageState(exists=False)
 
@@ -112,19 +133,62 @@ async def confirm_message_state(
     )
 
 
-async def _resolve_internal_id(service: Any, rfc_message_id: str) -> Optional[str]:
-    """Map an RFC 2822 Message-ID to Gmail's internal hex id via search. Returns None if
-    no message matches (empty list result)."""
-    resp = await asyncio.to_thread(
+async def _resolve_internal_id(
+    service: Any, rfc_message_id: str, max_scan: int
+) -> Optional[str]:
+    """Map an RFC 2822 Message-ID to Gmail's internal hex id WITHOUT `q` (forbidden under
+    the metadata scope). Lists messages most-recent-first and matches each candidate's
+    `Message-Id` header, reading only that one routing header per skipped message — never
+    content. Returns None if no message matches within `max_scan` examined."""
+    target = _normalize_message_id(rfc_message_id)
+    scanned = 0
+    page_token: Optional[str] = None
+
+    while scanned < max_scan:
+        page_size = min(100, max_scan - scanned)
+        token = page_token  # bind for the closure below
+        resp = await asyncio.to_thread(
+            lambda: service.users()
+            .messages()
+            .list(userId="me", maxResults=page_size, pageToken=token)
+            .execute()
+        )
+        for m in resp.get("messages", []) or []:
+            scanned += 1
+            header_value = await _message_id_header(service, m["id"])
+            if header_value is not None and _normalize_message_id(header_value) == target:
+                return m["id"]
+            if scanned >= max_scan:
+                break
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return None
+
+
+async def _message_id_header(service: Any, gmail_id: str) -> Optional[str]:
+    """Read ONLY the Message-Id header of one message (metadata format). No content."""
+    msg = await asyncio.to_thread(
         lambda: service.users()
         .messages()
-        .list(userId="me", q=f"rfc822msgid:{rfc_message_id}")
+        .get(
+            userId="me",
+            id=gmail_id,
+            format=MESSAGE_FORMAT,
+            metadataHeaders=[MESSAGE_ID_HEADER],
+        )
         .execute()
     )
-    messages = resp.get("messages") or []
-    if not messages:
-        return None
-    return messages[0]["id"]
+    for h in msg.get("payload", {}).get("headers", []) or []:
+        if h.get("name", "").lower() == MESSAGE_ID_HEADER.lower():
+            return h.get("value")
+    return None
+
+
+def _normalize_message_id(value: str) -> str:
+    """Compare Message-IDs robustly: drop surrounding angle brackets/whitespace and
+    casefold. Message-IDs are effectively unique tokens, so this is safe."""
+    return value.strip().strip("<>").strip().casefold()
 
 
 def _extract_state_headers(headers: list[dict]) -> dict[str, str]:
@@ -261,10 +325,16 @@ async def _amain(argv: list[str] | None = None) -> None:
         required=True,
         help='RFC 2822 Message-ID of a sent message, e.g. "<CAKs...@mail.gmail.com>"',
     )
+    parser.add_argument(
+        "--max-scan",
+        type=int,
+        default=DEFAULT_MAX_SCAN,
+        help=f"max messages examined during Message-ID resolution (default {DEFAULT_MAX_SCAN})",
+    )
     args = parser.parse_args(argv)
 
     configure_logging()
-    state = await confirm_message_state(args.rfc_id)
+    state = await confirm_message_state(args.rfc_id, max_scan=args.max_scan)
     print(_render(args.rfc_id, state))
 
 

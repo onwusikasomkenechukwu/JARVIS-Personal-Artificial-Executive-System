@@ -135,6 +135,15 @@ The state/content boundary is enforced in **two independent layers**:
 The metadata-scoped token is stored in the **credential vault** (`jarvis/vault.py`),
 outside the repo; the agent code path holds a `SecretHandle`, never the raw token.
 
+**Finding — the scope boundary bites (as intended).** The `gmail.metadata` scope
+*rejects* the `q` search parameter (`q` can match body text), so resolving the RFC
+Message-ID via `q=rfc822msgid:` returns `403 forbidden` under this scope. Rather than
+widen to `gmail.readonly`, resolution lists messages most-recent-first and matches each
+candidate's `Message-Id` header client-side — reading only that one routing header per
+skipped message, never content. Cost is bounded by `--max-scan`; for a just-sent message
+the match is near the front. Verified live: a real sent message returned
+`exists=True, is_sent=True, labels=[IMPORTANT, SENT, INBOX]`.
+
 ```bash
 # First run opens a browser for consent (click through the "unverified app" warning in
 # testing mode); later runs reuse the stored token.

@@ -1,7 +1,8 @@
 """Phase 2 — Gmail provider state-read tests.
 
-The live API is never touched: a MagicMock stands in for the Gmail service. These pin
-the state/content boundary (scope + format + type) so a future widening breaks a test.
+The live API is never touched: a fake service models Gmail's list/get under the metadata
+scope. These pin the state/content boundary (scope + format + type) and the metadata-safe
+resolution (no `q`), so a future widening or regression breaks a test.
 """
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,39 +21,85 @@ from jarvis.providers.gmail_state import (
 from jarvis.vault import CredentialVault
 
 
-def _service(list_result: dict, get_result: dict | None = None) -> MagicMock:
-    """A MagicMock shaped like the Gmail client: users().messages().list/get().execute()."""
-    svc = MagicMock()
-    messages = svc.users.return_value.messages.return_value
-    messages.list.return_value.execute.return_value = list_result
-    if get_result is not None:
-        messages.get.return_value.execute.return_value = get_result
-    return svc
+# --- A fake Gmail service modelling metadata-scope list/get -----------------
+
+class _Exec:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
 
 
-def _sent_get_result() -> dict:
+class _FakeMessages:
+    """Models users().messages(): list paginates ids; get returns labels + the requested
+    metadata headers. Records every list/get kwargs so tests can assert on them."""
+
+    def __init__(self, store, calls):
+        self._store = store  # list of {"id","labelIds","headers"(dict),"snippet"(opt)}
+        self.calls = calls
+
+    def list(self, userId, maxResults=100, pageToken=None, **extra):
+        self.calls["list"].append({"userId": userId, "maxResults": maxResults,
+                                    "pageToken": pageToken, **extra})
+        start = int(pageToken or 0)
+        page = self._store[start:start + maxResults]
+        resp = {"messages": [{"id": m["id"]} for m in page],
+                "resultSizeEstimate": len(self._store)}
+        nxt = start + maxResults
+        if nxt < len(self._store):
+            resp["nextPageToken"] = str(nxt)
+        return _Exec(resp)
+
+    def get(self, userId, id, format, metadataHeaders=None, **extra):
+        self.calls["get"].append({"id": id, "format": format,
+                                  "metadataHeaders": metadataHeaders, **extra})
+        m = next((x for x in self._store if x["id"] == id), None)
+        if m is None:
+            return _Exec({})
+        wanted = {h.lower() for h in (metadataHeaders or [])}
+        headers = [{"name": n, "value": v} for n, v in m["headers"].items()
+                   if not wanted or n.lower() in wanted]
+        resp = {"id": m["id"], "labelIds": list(m["labelIds"]),
+                "payload": {"headers": headers}}
+        if "snippet" in m:
+            resp["snippet"] = m["snippet"]
+        return _Exec(resp)
+
+
+class _FakeService:
+    def __init__(self, store):
+        self.calls = {"list": [], "get": []}
+        self._messages = _FakeMessages(store, self.calls)
+
+    def users(self):
+        return self
+
+    def messages(self):
+        return self._messages
+
+
+def _sent_msg(mid="<abc@mail.gmail.com>"):
     return {
         "id": "18ab12cd34ef",
         "labelIds": ["SENT", "INBOX", "CATEGORY_PERSONAL"],
         "snippet": "this body-derived snippet must never be read into MessageState",
-        "payload": {
-            "headers": [
-                {"name": "From", "value": "me@example.com"},
-                {"name": "To", "value": "me@example.com"},
-                {"name": "Subject", "value": "phase 2 test"},
-                {"name": "Date", "value": "Wed, 17 Jun 2026 09:00:00 -0000"},
-                {"name": "Received", "value": "should be ignored"},
-            ],
+        "headers": {
+            "Message-Id": mid,
+            "From": "me@example.com",
+            "To": "me@example.com",
+            "Subject": "phase 2 test",
+            "Date": "Wed, 17 Jun 2026 09:00:00 -0000",
+            "Received": "should be ignored",
         },
     }
 
 
+# --- Tests ------------------------------------------------------------------
+
 @pytest.mark.asyncio
 async def test_sent_message_reports_is_sent_true():
-    svc = _service(
-        list_result={"messages": [{"id": "18ab12cd34ef"}], "resultSizeEstimate": 1},
-        get_result=_sent_get_result(),
-    )
+    svc = _FakeService([_sent_msg()])
     state = await confirm_message_state("<abc@mail.gmail.com>", service=svc)
 
     assert state.exists is True
@@ -68,8 +115,16 @@ async def test_sent_message_reports_is_sent_true():
 
 
 @pytest.mark.asyncio
+async def test_match_is_robust_to_angle_brackets_and_case():
+    # stored with brackets + mixed case; caller passes a bare, differently-cased id
+    svc = _FakeService([_sent_msg(mid="<AbC@Mail.Gmail.Com>")])
+    state = await confirm_message_state("abc@mail.gmail.com", service=svc)
+    assert state.exists is True and state.is_sent is True
+
+
+@pytest.mark.asyncio
 async def test_unresolvable_message_id_returns_exists_false():
-    svc = _service(list_result={"resultSizeEstimate": 0})  # empty list -> no `messages`
+    svc = _FakeService([_sent_msg(mid="<other@mail.gmail.com>")])
     state = await confirm_message_state("<nope@mail.gmail.com>", service=svc)
 
     assert state.exists is False
@@ -77,34 +132,45 @@ async def test_unresolvable_message_id_returns_exists_false():
     assert state.is_sent is False
     assert state.labels == []
     assert state.headers == {}
-    # never called get when nothing resolved
-    svc.users.return_value.messages.return_value.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolution_never_uses_q_parameter():
+    # The metadata scope rejects `q`; the resolver must never pass it.
+    svc = _FakeService([_sent_msg(mid=f"<m{i}@mail.gmail.com>") | {"id": f"id{i}"}
+                        for i in range(5)])
+    await confirm_message_state("<m3@mail.gmail.com>", service=svc)
+    for call in svc.calls["list"]:
+        assert "q" not in call
+        assert "query" not in call
 
 
 @pytest.mark.asyncio
 async def test_get_called_with_metadata_format_not_full_or_raw():
-    svc = _service(
-        list_result={"messages": [{"id": "18ab12cd34ef"}]},
-        get_result=_sent_get_result(),
-    )
+    svc = _FakeService([_sent_msg()])
     await confirm_message_state("<abc@mail.gmail.com>", service=svc)
 
-    get = svc.users.return_value.messages.return_value.get
-    get.assert_called_once()
-    _, kwargs = get.call_args
-    assert kwargs["format"] == "metadata"
-    assert kwargs["format"] not in ("full", "raw")
+    assert svc.calls["get"], "get was never called"
+    for call in svc.calls["get"]:
+        assert call["format"] == "metadata"
+        assert call["format"] not in ("full", "raw")
     assert MESSAGE_FORMAT == "metadata"
 
 
 @pytest.mark.asyncio
+async def test_max_scan_bounds_the_search():
+    # target is the 6th message but max_scan=3 -> not found, and at most 3 gets happen
+    store = [_sent_msg(mid=f"<m{i}@mail.gmail.com>") | {"id": f"id{i}"} for i in range(10)]
+    svc = _FakeService(store)
+    state = await confirm_message_state("<m5@mail.gmail.com>", service=svc, max_scan=3)
+    assert state.exists is False
+    assert len(svc.calls["get"]) <= 3
+
+
+@pytest.mark.asyncio
 async def test_snippet_is_never_read_into_state():
-    svc = _service(
-        list_result={"messages": [{"id": "18ab12cd34ef"}]},
-        get_result=_sent_get_result(),  # carries a "snippet"
-    )
+    svc = _FakeService([_sent_msg()])
     state = await confirm_message_state("<abc@mail.gmail.com>", service=svc)
-    # No field, anywhere, holds the snippet text.
     assert "snippet" not in state.model_dump()
     for value in state.model_dump().values():
         assert "body-derived snippet" not in str(value)
@@ -155,7 +221,6 @@ def test_client_secret_loaded_from_configured_dir_not_repo(tmp_path, monkeypatch
     found = find_client_secret_file(str(tmp_path))
 
     assert found == secret
-    # never resolved from inside the repo working tree
     repo_root = Path(__file__).resolve().parents[1]
     assert repo_root not in found.resolve().parents
 
@@ -168,6 +233,5 @@ def test_missing_client_secret_raises():
 def test_vault_handle_does_not_expose_secret():
     vault = CredentialVault(path="/tmp/whatever")
     handle = vault.handle("gmail_metadata_token.json")
-    # repr/str carry the key name, never any secret payload.
     assert "gmail_metadata_token.json" in repr(handle)
     assert "token" in repr(handle)  # the key, not a value
