@@ -136,11 +136,24 @@ async def confirm_message_state(
 async def _resolve_internal_id(
     service: Any, rfc_message_id: str, max_scan: int
 ) -> Optional[str]:
-    """Map an RFC 2822 Message-ID to Gmail's internal hex id WITHOUT `q` (forbidden under
-    the metadata scope). Lists messages most-recent-first and matches each candidate's
-    `Message-Id` header, reading only that one routing header per skipped message — never
-    content. Returns None if no message matches within `max_scan` examined."""
+    """First internal id whose `Message-Id` header matches `rfc_message_id`, or None.
+    Thin wrapper over `find_internal_ids` that short-circuits on the first match (the
+    common case for a just-sent message near the front of recency order)."""
+    ids = await find_internal_ids(service, rfc_message_id, max_scan, first_only=True)
+    return ids[0] if ids else None
+
+
+async def find_internal_ids(
+    service: Any, rfc_message_id: str, max_scan: int, *, first_only: bool = False
+) -> list[str]:
+    """All internal ids whose `Message-Id` header matches `rfc_message_id` (normally 0
+    or 1; **>1 means the same message was sent more than once** — the double-send
+    backstop the verifier checks). Maps WITHOUT `q` (forbidden under the metadata scope):
+    lists messages most-recent-first and matches each candidate's `Message-Id` header,
+    reading only that one routing header per message — never content. Bounded by
+    `max_scan`. With `first_only`, returns as soon as one matches."""
     target = _normalize_message_id(rfc_message_id)
+    found: list[str] = []
     scanned = 0
     page_token: Optional[str] = None
 
@@ -157,13 +170,65 @@ async def _resolve_internal_id(
             scanned += 1
             header_value = await _message_id_header(service, m["id"])
             if header_value is not None and _normalize_message_id(header_value) == target:
-                return m["id"]
+                found.append(m["id"])
+                if first_only:
+                    return found
             if scanned >= max_scan:
                 break
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    return None
+    return found
+
+
+async def scan_sent_headers(
+    service: Any, header_names: list[str], max_scan: int
+) -> list[dict]:
+    """Scan recent messages (most-recent-first, bounded by `max_scan`) and return, for
+    each, `{"id", "labels", "headers"}` where `headers` holds only the requested
+    `header_names` that are present. Metadata-only: requests just those headers +
+    labelIds, never a body part. Used by the send action's content-hash idempotency
+    guard (match an idempotency marker WE set, on the user's own outbound mail)."""
+    out: list[dict] = []
+    scanned = 0
+    page_token: Optional[str] = None
+
+    while scanned < max_scan:
+        page_size = min(100, max_scan - scanned)
+        token = page_token
+        resp = await asyncio.to_thread(
+            lambda: service.users()
+            .messages()
+            .list(userId="me", maxResults=page_size, pageToken=token)
+            .execute()
+        )
+        for m in resp.get("messages", []) or []:
+            scanned += 1
+            mid = m["id"]
+            msg = await asyncio.to_thread(
+                lambda mid=mid: service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format=MESSAGE_FORMAT,
+                    metadataHeaders=list(header_names),
+                )
+                .execute()
+            )
+            headers = {
+                h.get("name", ""): h.get("value", "")
+                for h in msg.get("payload", {}).get("headers", []) or []
+            }
+            out.append(
+                {"id": mid, "labels": list(msg.get("labelIds", []) or []), "headers": headers}
+            )
+            if scanned >= max_scan:
+                break
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
 
 async def _message_id_header(service: Any, gmail_id: str) -> Optional[str]:
@@ -225,45 +290,61 @@ def find_client_secret_file(client_secret_dir: Optional[str] = None):
 def load_gmail_credentials(
     vault: Optional[CredentialVault] = None,
     client_secret_dir: Optional[str] = None,
+    *,
+    scopes: Optional[list[str]] = None,
+    token_key: str = GMAIL_TOKEN_KEY,
 ):
-    """Return metadata-scoped Google credentials, loading/refreshing the vault token or
-    running the installed-app consent flow on first use. The token is written back to the
-    vault; it is never returned to or logged by the agent path (callers get a built
-    service, never these credentials)."""
-    vault = vault or CredentialVault()
-    handle = vault.handle(GMAIL_TOKEN_KEY)
+    """Return Google credentials for `scopes` (default: the metadata scope), loading/
+    refreshing the vault token under `token_key` or running the installed-app consent
+    flow on first use. The token is written back to the vault; it is never returned to or
+    logged by the agent path (callers get a built service, never these credentials).
 
-    creds = _load_token(vault, handle)
+    `scopes` + `token_key` are parameterised so a *second* credential (the send scope,
+    stored under its own token file) can reuse this exact flow — Principle 4 at the
+    credential layer: send and confirm-sent never share one token. The two are kept in
+    separate vault files and never co-granted."""
+    scopes = scopes or SCOPES
+    vault = vault or CredentialVault()
+    handle = vault.handle(token_key)
+
+    creds = _load_token(vault, handle, scopes)
     if creds is not None and creds.valid:
         return creds
     if creds is not None and creds.expired and creds.refresh_token:
         creds = _refresh(creds)
         _store_token(vault, handle, creds)
-        log.info("gmail_token_refreshed", scope="gmail.metadata")
+        log.info("gmail_token_refreshed", scopes=scopes)
         return creds
 
     secret_file = find_client_secret_file(client_secret_dir)
-    creds = _run_installed_app_flow(str(secret_file), SCOPES)
+    creds = _run_installed_app_flow(str(secret_file), scopes)
     _store_token(vault, handle, creds)
-    log.info("gmail_consent_completed", scope="gmail.metadata")
+    log.info("gmail_consent_completed", scopes=scopes)
     return creds
 
 
 def build_gmail_service(
     vault: Optional[CredentialVault] = None,
     client_secret_dir: Optional[str] = None,
+    *,
+    scopes: Optional[list[str]] = None,
+    token_key: str = GMAIL_TOKEN_KEY,
 ) -> Any:
-    """Build the Gmail API client from metadata-scoped vault credentials."""
+    """Build a Gmail API client from vault credentials. Defaults to the metadata scope;
+    pass `scopes`/`token_key` to build a differently-scoped client (e.g. the send action)
+    from its own separate token."""
     from googleapiclient.discovery import build
 
-    creds = load_gmail_credentials(vault=vault, client_secret_dir=client_secret_dir)
+    creds = load_gmail_credentials(
+        vault=vault, client_secret_dir=client_secret_dir, scopes=scopes, token_key=token_key
+    )
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
 # The google-specific seams below import lazily, so MessageState / confirm_message_state
 # and their tests run without the google libraries installed (mirrors lazy Playwright).
 
-def _load_token(vault: CredentialVault, handle: SecretHandle):
+def _load_token(vault: CredentialVault, handle: SecretHandle, scopes: Optional[list[str]] = None):
     raw = vault.read_bytes(handle)
     if raw is None:
         return None
@@ -271,7 +352,7 @@ def _load_token(vault: CredentialVault, handle: SecretHandle):
 
     from google.oauth2.credentials import Credentials
 
-    return Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+    return Credentials.from_authorized_user_info(json.loads(raw), scopes or SCOPES)
 
 
 def _store_token(vault: CredentialVault, handle: SecretHandle, creds) -> None:

@@ -160,6 +160,70 @@ Code: `jarvis/providers/gmail_state.py`. Tests (mocked Gmail, no live API):
 any scope beyond `gmail.metadata`, and the verifier exercise itself (there is no
 side-effecting action to verify yet).
 
+## Phase 2 (in progress) — user-instructed email send
+
+The first action that acts **irreversibly on the outside world**, and the first time the
+whole safety spine has to *compose* into one flow rather than pass as separate unit tests:
+
+```
+draft → PRE-SEND GUARD → OUT-OF-BAND CONFIRM → SEND → POST-SEND VERIFY
+```
+
+Scope is deliberately narrow: a send the **user explicitly instructed** (recipient/subject/
+body from the CLI). Provenance is `USER_DIRECT` by construction — there is no code path
+that builds a `SendRequest` from content JARVIS read. (Acting on untrusted content is the
+next, harder build; the provenance gate gets its real test there.)
+
+Two properties carry this build:
+
+1. **At-most-once under retry** (the single most important property). Gmail has no
+   provider-side send idempotency, and the transport may retry a send that *succeeded
+   server-side but timed out client-side*. The pre-send guard is re-checked before **every**
+   send attempt; if a prior attempt actually delivered, the guard sees it and refuses the
+   duplicate. Retry + guard re-check = at-most-once — wired, not hoped for. The idempotency
+   key is the request's `content_hash`, embedded in an `X-Jarvis-Content-Hash` header we set
+   and read back through the metadata scope (matching a marker we authored, no body access).
+   *Honest limit (documented):* a check-then-send race exists; safe for single-at-a-time,
+   **not** for concurrent/autonomous sending — which is out of scope and not enabled.
+2. **Decorrelated send-and-verify** (Principle 4 at the credential layer). **Two scopes,
+   two tokens, never co-granted:** `gmail.send` can only send and cannot read state;
+   `gmail.metadata` can only read state and cannot send. The credential that sends cannot
+   forge the verification of its own send. Post-send verification confirms a SENT message
+   carrying the `content_hash` exists through the *metadata* token and counts matches —
+   `>1` is a double-send, surfaced loudly as a backstop.
+
+**Finding — Gmail rewrites client Message-IDs; the content-hash header is the durable
+handle.** The first design verified by resolving the Message-ID we generated. A live send
+proved Gmail *replaces* a client-supplied Message-ID with its own `<…@mail.gmail.com>`, so
+that lookup found nothing even though the mail sent. The `X-Jarvis-Content-Hash` header we
+set, however, **is preserved** (confirmed live). So both the guard and the verifier key on
+the content-hash — a marker we authored, read back through metadata, depending on neither
+the send response nor Gmail's Message-ID handling. Verified live: a real send to self came
+back `verified=True, duplicate_count=1` through the metadata token. Mocked tests alone
+could not have caught this (the fake preserved the Message-ID); the live send was required.
+
+The **Level 3 out-of-band confirmation** runs in a separate process (the requesting path
+cannot self-approve) and shows the **full** email — recipient, subject, complete body, no
+truncation. Timeout / no-response is default-safe (no send).
+
+```bash
+# Terminal 1 — runs the pipeline; blocks at the confirmation gate.
+# First run opens a second browser consent for gmail.send (separate token from metadata).
+python -m jarvis.actions.send_email --to you@example.com --subject "hi" --body "..."
+
+# Terminal 2 — the out-of-band approver (review the FULL email, then approve):
+python -m jarvis.confirm list
+python -m jarvis.confirm approve <id>      # or: deny <id>
+```
+
+Code: `jarvis/actions/send_email.py`. Tests (mocked Gmail, no live API):
+`tests/test_send_email.py` — including the load-bearing
+`test_retry_after_timeout_success_sends_once`.
+
+**Out of scope for this build:** JARVIS-initiated send or any send triggered by content
+JARVIS read; reading bodies/inbound mail; concurrent/batched sending; a single combined
+scope (always two scopes, two tokens).
+
 ### Setup
 
 ```bash
@@ -178,7 +242,7 @@ CREATE ROLE jarvis LOGIN PASSWORD 'jarvis';
 CREATE DATABASE jarvis OWNER jarvis;
 ```
 
-### Run the tests (41 — logic, harness mechanics, spike, Gmail state-read)
+### Run the tests (59 — logic, harness mechanics, spike, Gmail state-read + send)
 
 ```bash
 pytest
