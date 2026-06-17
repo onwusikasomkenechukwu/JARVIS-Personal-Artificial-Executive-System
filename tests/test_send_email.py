@@ -173,7 +173,7 @@ def _req(body="hello from the phase-2 send test"):
     return SendRequest(to="me@example.com", subject="phase 2 send", body=body)
 
 
-FAST = dict(send_backoff_s=0, verify_attempts=1, verify_delay_s=0)
+FAST = dict(send_backoff_s=0, min_resend_gap_s=0, verify_attempts=1, verify_delay_s=0)
 
 
 # --- Tests ------------------------------------------------------------------
@@ -418,6 +418,49 @@ async def test_send_is_tagged_user_direct():
     assert isinstance(r.confirmation, ConfirmationRecord)
     assert r.confirmation.provenance == "USER_DIRECT"
     assert r.confirmation.source == "user"
+
+
+def test_resend_gap_floor_exceeds_measured_visibility_gap():
+    """The pre-retry settle floor must stay above the live-measured index-visibility gap
+    (0.36–0.61s), so a retry never re-checks the guard inside the window where a delivered
+    send isn't yet visible. Lowering it back under that gap reopens a double-send hole."""
+    from jarvis.actions.send_email import MIN_RESEND_GAP_S
+    MEASURED_VISIBILITY_GAP_MAX_S = 0.61
+    assert MIN_RESEND_GAP_S >= 2 * MEASURED_VISIBILITY_GAP_MAX_S
+
+
+@pytest.mark.asyncio
+async def test_retry_waits_at_least_the_resend_gap(monkeypatch):
+    """On a retryable failure, the wait before the next guard re-check honours the settle
+    floor (we assert the max sleep requested clears it)."""
+    backend = FakeBackend()
+
+    class FailOnceNoRecord(FakeSendService):
+        def send(self, userId, body):
+            outer = self
+
+            class E:
+                def execute(self_inner):
+                    outer.send_calls += 1
+                    if outer.send_calls == 1:
+                        raise TimeoutError("transient")
+                    return {"id": outer.backend.append_from_raw(body["raw"]), "labelIds": ["SENT"]}
+            return E()
+
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("jarvis.actions.send_email.asyncio.sleep", fake_sleep)
+
+    r = await send_email(_req(), send_service=FailOnceNoRecord(backend),
+                         state_service=FakeMetadataService(backend),
+                         channel=CapturingChannel(approve=True),
+                         min_resend_gap_s=3.0, send_backoff_s=0.5,
+                         verify_attempts=1, verify_delay_s=0)
+    assert r.sent is True
+    assert max(sleeps) >= 3.0  # the settle floor was applied before the retry
 
 
 def test_content_hash_is_stable_and_normalised():

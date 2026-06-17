@@ -24,10 +24,15 @@ Two design properties carry this build:
    `X-Jarvis-Content-Hash` header WE set on the outbound MIME. The guard reads that header
    back off recent sent mail through the *metadata* scope (which cannot read bodies, and
    rejects `q`-search — see gmail_state). Matching a marker we authored, on the user's own
-   outbound mail, needs no body access. Honest limit (documented, not fixed): there is a
-   check-then-send race between the guard passing and the send firing. It is safe for a
-   single-user system sending one at a time; it is NOT safe for concurrent/autonomous
-   sending, which is out of scope and must not be enabled here.
+   outbound mail, needs no body access.
+
+   For the guard to catch a timed-out-but-delivered send, its re-check must run AFTER that
+   send becomes visible to the metadata read. The index-visibility gap was measured live
+   at 0.36–0.61s; `MIN_RESEND_GAP_S` (the floor on the pre-retry wait) sits well above it,
+   so a retry never queries inside the visibility window. Honest limit (documented, not
+   fixed): there is still a check-then-send race between the guard passing and the send
+   firing. It is safe for a single-user system sending one at a time; it is NOT safe for
+   concurrent/autonomous sending, which is out of scope and must not be enabled here.
 
 2. DECORRELATED SEND-AND-VERIFY (Principle 4 at the credential layer). The credential that
    sends and the credential that confirms-sent are different OAuth scopes with different
@@ -72,8 +77,14 @@ CONTENT_HASH_HEADER = "X-Jarvis-Content-Hash"
 # duplicate is at the front of recency order). Bounds the metadata scan.
 DEFAULT_GUARD_SCAN = 50
 # Verification scans a tighter window: a genuine double-send produces two messages with
-# the SAME Message-ID, adjacent at the very front of recency order.
+# the SAME content-hash, adjacent at the very front of recency order.
 VERIFY_MAX_SCAN = 25
+
+# Minimum wait before a retry re-checks the guard. Must exceed the measured index-
+# visibility gap (the lag between Gmail accepting a send and the guard's metadata read
+# seeing it) so a retry never queries inside that window and re-sends a message that
+# already landed. Live measurement: 0.36–0.61s; this floor leaves comfortable margin.
+MIN_RESEND_GAP_S = 3.0
 
 
 # --- Typed request / result -------------------------------------------------
@@ -283,6 +294,7 @@ async def send_email(
     guard_scan: int = DEFAULT_GUARD_SCAN,
     verify_scan: int = VERIFY_MAX_SCAN,
     send_backoff_s: float = 0.5,
+    min_resend_gap_s: float = MIN_RESEND_GAP_S,
     verify_attempts: int = 5,
     verify_delay_s: float = 1.0,
 ) -> SendResult:
@@ -367,7 +379,13 @@ async def send_email(
                 )
             log.warning("send_retryable_error", attempt=attempt, error=last_err)
             if attempt < max_send_attempts:
-                await asyncio.sleep(send_backoff_s * attempt)
+                # The wait before re-checking the guard MUST exceed the index-visibility
+                # gap — the window between Gmail accepting a send and that send becoming
+                # visible to the guard's metadata read. A retry that re-checks inside that
+                # window would see nothing and re-send a message that already landed. Live
+                # measurement put the gap at 0.36–0.61s; the floor (MIN_RESEND_GAP_S) sits
+                # well above it with margin, so the guard never out-runs visibility.
+                await asyncio.sleep(max(min_resend_gap_s, send_backoff_s * attempt))
             # loop continues → guard is re-checked before the next attempt
 
     # Stage 5: verify through the metadata credential (decorrelated from the send),

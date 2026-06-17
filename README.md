@@ -183,8 +183,12 @@ Two properties carry this build:
    duplicate. Retry + guard re-check = at-most-once — wired, not hoped for. The idempotency
    key is the request's `content_hash`, embedded in an `X-Jarvis-Content-Hash` header we set
    and read back through the metadata scope (matching a marker we authored, no body access).
-   *Honest limit (documented):* a check-then-send race exists; safe for single-at-a-time,
-   **not** for concurrent/autonomous sending — which is out of scope and not enabled.
+   For the re-check to catch a timed-out-but-delivered send, it must run after the send
+   becomes visible to the metadata read; that **index-visibility gap was measured live at
+   0.36–0.61s**, and the pre-retry settle floor (`MIN_RESEND_GAP_S = 3.0`) sits well above
+   it, so a retry never queries inside the window. *Honest limit (documented):* a
+   check-then-send race still exists; safe for single-at-a-time, **not** for
+   concurrent/autonomous sending — which is out of scope and not enabled.
 2. **Decorrelated send-and-verify** (Principle 4 at the credential layer). **Two scopes,
    two tokens, never co-granted:** `gmail.send` can only send and cannot read state;
    `gmail.metadata` can only read state and cannot send. The credential that sends cannot
