@@ -6,6 +6,9 @@
 secrets/
 vault/
 credentials.json
+client_secret_*.json
+*token*.json
+.jarvis/
 
 # Python
 __pycache__/

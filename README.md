@@ -83,7 +83,7 @@ harness-class:           0  (0.0%)     <- ~0, so the number is trustworthy
 this is a **floor on difficulty, not a representative number** — it proves the executor
 works when a site behaves, not that browsing is reliable against hostile sites.
 
-### Milestones (all built, tested — 31 passing tests)
+### Milestones (all built, tested — 41 passing tests)
 
 | Milestone | Module | Status | Tests |
 |-----------|--------|--------|-------|
@@ -109,6 +109,48 @@ Full honest findings — including why the green result came cheap and where the
 is still unproven — in [`docs/verification-spike-findings.md`](docs/verification-spike-findings.md).
 Code: `jarvis/spikes/decorrelated_verification.py`.
 
+## Phase 2 (in progress) — provider state-read
+
+The first **trusted, decorrelated ground-truth channel**: confirm a message shows as
+*sent* in Gmail, reading only provider state (labels + the user's own headers) and
+**never** message content. This is the ground-truth check a future send action's verifier
+will call — built and proven in isolation before any send exists.
+
+A provider API has two trust characters that must not be conflated:
+
+- **Provider state** (labels, existence, provider/user-set headers) is the provider's own
+  assertion, trusted-ish ground truth through an authenticated channel.
+- **Message content** (bodies, attacker-authored inbound headers) is `UNTRUSTED_DERIVED`
+  regardless of the authenticated envelope it arrives in — and is never read here.
+
+The state/content boundary is enforced in **two independent layers**:
+
+1. **Scope** — OAuth scope is `gmail.metadata` *only*. That scope grants labels/headers
+   and cannot return a body; the provider enforces it at the API. Widening it is a
+   separate, re-consented change — a scope-widening deliberately breaks a test.
+2. **Type** — `MessageState` carries only `{exists, gmail_id, labels, headers, is_sent}`
+   and structurally cannot hold a body, snippet, or payload. Belt and suspenders; the
+   belt is Google's.
+
+The metadata-scoped token is stored in the **credential vault** (`jarvis/vault.py`),
+outside the repo; the agent code path holds a `SecretHandle`, never the raw token.
+
+```bash
+# First run opens a browser for consent (click through the "unverified app" warning in
+# testing mode); later runs reuse the stored token.
+python -m jarvis.providers.gmail_state --rfc-id "<CAKs...@mail.gmail.com>"
+```
+
+Prereqs (configured by the user, outside the repo): Gmail API enabled, OAuth consent
+screen in testing mode with scope `gmail.metadata`, a Desktop-app client-secret JSON in
+`JARVIS_GMAIL_CLIENT_SECRET_DIR` (default `C:\Users\onwus\.jarvis`), discovered by glob.
+Code: `jarvis/providers/gmail_state.py`. Tests (mocked Gmail, no live API):
+`tests/test_gmail_state.py`.
+
+**Out of scope for this build:** any send/compose/modify, any body/snippet/inbound read,
+any scope beyond `gmail.metadata`, and the verifier exercise itself (there is no
+side-effecting action to verify yet).
+
 ### Setup
 
 ```bash
@@ -127,7 +169,7 @@ CREATE ROLE jarvis LOGIN PASSWORD 'jarvis';
 CREATE DATABASE jarvis OWNER jarvis;
 ```
 
-### Run the tests (31 — logic, harness mechanics, spike)
+### Run the tests (41 — logic, harness mechanics, spike, Gmail state-read)
 
 ```bash
 pytest

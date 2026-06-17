@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     # Out-of-band confirmation
     pending_confirm_dir: str = "./.pending_confirmations"
 
+    # Credential vault — secret material (e.g. the Gmail token) lives here, OUTSIDE
+    # the repo. The orchestrating code path holds a handle, never the raw secret.
+    vault_dir: str = r"C:\Users\onwus\.jarvis\vault"
+
+    # Gmail provider state-read (Phase 2). The OAuth client-secret JSON Google issued
+    # is discovered by glob (client_secret_*.json) in this dir; the filename is never
+    # hardcoded and the secret is never copied into the repo.
+    gmail_client_secret_dir: str = r"C:\Users\onwus\.jarvis"
+
     # Logging
     log_level: str = "INFO"
 

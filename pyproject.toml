@@ -9,6 +9,10 @@ dependencies = [
     "pydantic-settings>=2.2",
     "asyncpg>=0.29",
     "structlog>=24.1",
+    # Phase 2 — Gmail provider state-read (metadata scope only)
+    "google-auth>=2.29",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.130",
 ]
 
 [project.optional-dependencies]
