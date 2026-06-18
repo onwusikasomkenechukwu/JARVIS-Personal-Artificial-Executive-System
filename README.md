@@ -228,6 +228,60 @@ Code: `jarvis/actions/send_email.py`. Tests (mocked Gmail, no live API):
 JARVIS read; reading bodies/inbound mail; concurrent/batched sending; a single combined
 scope (always two scopes, two tokens).
 
+## Phase 2 (in progress) — read-and-report digest (own data only)
+
+An **observe-and-report** capability: JARVIS reads the user's **own** calendar and **own**
+sent mail and renders a "plate" digest the user reads. It takes **no** action on the world
+— no send, no write, no calendar modification. Everything is Level 0/1 (read / report), so
+it carries no send/confirm spine: there is no side effect to gate.
+
+```bash
+# First run opens a browser for the calendar.readonly consent (its OWN token, separate
+# from every Gmail token). Later runs refresh silently.
+python -m jarvis.actions.digest --days 7
+```
+
+Three data sources, two trust levels — and the calendar invite is the new untrusted surface:
+
+- **Own calendar events** and **own sent mail** are own data (the user authored them).
+- **A calendar event the user was INVITED to** is attacker-authorable: an external party
+  controls the event's title, description, and location. The **description on an external
+  invite is an injection surface, exactly like an email body** ("Meeting: your account is
+  suspended, click bit.ly/xyz"). A naive digest would surface it as if it were the user's
+  own agenda item.
+
+**The one security-load-bearing property — structural, not a render choice.**
+`CalendarEvent.notes` is populated **only** from `is_own=True` events. An external invite's
+description sets `has_external_description=True` and the text is **dropped in the mapping**
+— it never reaches the typed object, so the renderer never has it to leak. The digest shows
+`[external invite — description not shown]` instead. Titles/locations of external invites
+are lower-risk but still attacker-set, so they are carried as **plain inert text** (no link
+extraction, never treated as instruction). This is the calendar analog of the inbound-mail
+boundary — the part most people forget is an injection surface.
+
+**Reads zero inbound mail.** "What's on my plate" here is own-calendar + own-sent, full
+stop. The sent summary lists with `labelIds=["SENT"]` (a label filter the `gmail.metadata`
+scope permits — unlike `q`, which it rejects), so inbound messages are never even fetched.
+Things-people-are-waiting-on-from-inbound is a separate future build with its own threat
+model and is deliberately absent.
+
+Two read-only scopes, **three** separate vault tokens (calendar token never shared with
+either Gmail token):
+
+| Source | Scope | Vault token |
+|--------|-------|-------------|
+| Calendar | `calendar.readonly` (cannot create/modify/delete — provider-enforced) | `calendar_readonly_token.json` |
+| Sent mail | `gmail.metadata` (headers/labels only, no bodies — reused) | `gmail_metadata_token.json` |
+
+Code: `jarvis/providers/calendar_state.py`, `jarvis/actions/digest.py`. Tests (mocked
+Google services, no live API): `tests/test_digest.py` — including the load-bearing
+`test_injection_external_description_never_reaches_digest`.
+
+**Out of scope for this build:** any action (no send / no calendar create-modify-delete /
+no replies); any inbound-mail read; surfacing external-invite free text; scheduled /
+background / proactive running (this is a one-shot, user-invoked read); link extraction or
+any treatment of calendar/mail text as actionable.
+
 ### Setup
 
 ```bash

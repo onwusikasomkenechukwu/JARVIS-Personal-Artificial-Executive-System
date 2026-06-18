@@ -182,13 +182,22 @@ async def find_internal_ids(
 
 
 async def scan_sent_headers(
-    service: Any, header_names: list[str], max_scan: int
+    service: Any,
+    header_names: list[str],
+    max_scan: int,
+    *,
+    label_ids: Optional[list[str]] = None,
 ) -> list[dict]:
     """Scan recent messages (most-recent-first, bounded by `max_scan`) and return, for
     each, `{"id", "labels", "headers"}` where `headers` holds only the requested
     `header_names` that are present. Metadata-only: requests just those headers +
     labelIds, never a body part. Used by the send action's content-hash idempotency
-    guard (match an idempotency marker WE set, on the user's own outbound mail)."""
+    guard (match an idempotency marker WE set, on the user's own outbound mail).
+
+    `label_ids` (e.g. `["SENT"]`) filters the listing server-side by label. `labelIds`
+    is NOT the `q` parameter — it filters on labels, not body text, so the metadata scope
+    permits it. Passing `["SENT"]` means inbound messages are never listed or fetched at
+    all (the digest's own-sent summary relies on this to read zero inbound mail)."""
     out: list[dict] = []
     scanned = 0
     page_token: Optional[str] = None
@@ -196,11 +205,15 @@ async def scan_sent_headers(
     while scanned < max_scan:
         page_size = min(100, max_scan - scanned)
         token = page_token
+        list_kwargs: dict[str, Any] = {
+            "userId": "me",
+            "maxResults": page_size,
+            "pageToken": token,
+        }
+        if label_ids is not None:
+            list_kwargs["labelIds"] = label_ids
         resp = await asyncio.to_thread(
-            lambda: service.users()
-            .messages()
-            .list(userId="me", maxResults=page_size, pageToken=token)
-            .execute()
+            lambda lk=list_kwargs: service.users().messages().list(**lk).execute()
         )
         for m in resp.get("messages", []) or []:
             scanned += 1
